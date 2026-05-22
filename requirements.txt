@@ -1,3 +1,11 @@
-streamlit
-pandas
-plotly
+# Core scraping
+playwright==1.44.0
+rapidfuzz==3.9.3
+
+# Data handling
+pandas==2.2.2
+
+# Dashboard (only needed locally — not used by GitHub Actions)
+streamlit==1.35.0
+plotly==5.22.0
+streamlit-autorefresh==1.0.1

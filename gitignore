@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Playwright browser cache (large — install fresh in CI)
+/ms-playwright/
+
+# Streamlit local cache
+.streamlit/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs (optional — remove this line to also commit scraper.log)
+scraper.log

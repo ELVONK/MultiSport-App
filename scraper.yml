@@ -1,0 +1,89 @@
+name: Odibets × Flashscore Scraper
+
+# ── Triggers ──────────────────────────────────────────────────────────────────
+on:
+  schedule:
+    # Every 4 hours (UTC). Nairobi (EAT) = UTC+3, so runs at:
+    # 03:00, 07:00, 11:00, 15:00, 19:00, 23:00 EAT
+    - cron: "0 0,4,8,12,16,20 * * *"
+
+  # Also allow a manual trigger from the Actions tab
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: "Reason for manual run"
+        required: false
+        default: "Manual trigger"
+
+# ── Permissions ───────────────────────────────────────────────────────────────
+permissions:
+  contents: write      # needed to push daily_log.csv back to the repo
+
+# ── Jobs ──────────────────────────────────────────────────────────────────────
+jobs:
+  scrape:
+    name: Scrape & Commit
+    runs-on: ubuntu-latest
+    timeout-minutes: 30          # kill the job if it hangs
+
+    steps:
+
+      # 1. Check out the repo (including any previously committed CSV)
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      # 2. Set up Python
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      # 3. Install Python dependencies
+      - name: Install Python dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # 4. Install Playwright's Chromium browser + OS dependencies
+      - name: Install Playwright Chromium
+        run: |
+          playwright install chromium
+          playwright install-deps chromium
+
+      # 5. Run the scraper (single run — no --loop flag)
+      - name: Run scraper
+        run: python scraper.py
+        env:
+          # Playwright needs this in some CI environments
+          PLAYWRIGHT_BROWSERS_PATH: /home/runner/.cache/ms-playwright
+
+      # 6. Commit & push the updated CSV back to the repo
+      - name: Commit updated CSV
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Stage the CSV (and optional log file if scraper writes one)
+          git add daily_log.csv || true
+          git add scraper.log   || true
+
+          # Only commit if there are actual changes
+          if git diff --cached --quiet; then
+            echo "No changes to commit — CSV unchanged."
+          else
+            TIMESTAMP=$(TZ=Africa/Nairobi date '+%Y-%m-%d %H:%M EAT')
+            git commit -m "chore: auto-update daily_log.csv — ${TIMESTAMP}"
+            git push
+          fi
+
+      # 7. Upload CSV as a downloadable workflow artifact (30-day retention)
+      - name: Upload CSV artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: daily_log_${{ github.run_id }}
+          path: daily_log.csv
+          retention-days: 30
+          if-no-files-found: warn
