@@ -1,189 +1,330 @@
+"""
+Discrepancy Analytics Dashboard
+================================
+Reads the sectioned CSV produced by scraper.py and displays three
+clearly separated views: Discrepancy | No Discrepancy | Unmatched.
+
+Run:
+    streamlit run dashboard.py
+"""
+
 import streamlit as st
 import pandas as pd
 import plotly.express as px
 from datetime import datetime
-import time
+from pathlib import Path
+import io
 
-# ─────────────────────────────────────────────
-# PAGE CONFIG  (must be the very first st call)
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# CONFIG  (must be the very first Streamlit call)
+# ─────────────────────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="Discrepancy Analytics Dashboard",
+    page_title="Match Discrepancy Dashboard",
     page_icon="⚡",
     layout="wide",
 )
 
-# ─────────────────────────────────────────────
-# AUTO-REFRESH EVERY 2 HOURS (7200 seconds)
-# Uses streamlit-autorefresh if installed,
-# otherwise falls back to meta-refresh HTML.
-# ─────────────────────────────────────────────
-REFRESH_INTERVAL_SEC = 7200  # 2 hours
+REFRESH_INTERVAL_SEC = 7_200   # 2 hours
+CSV_PATH = Path("daily_log.csv")
 
+# ── Auto-refresh ──────────────────────────────────────────────────────────────
 try:
-    from streamlit_autorefresh import st_autorefresh  # pip install streamlit-autorefresh
-    st_autorefresh(interval=REFRESH_INTERVAL_SEC * 1000, key="dashboard_refresh")
+    from streamlit_autorefresh import st_autorefresh
+    st_autorefresh(interval=REFRESH_INTERVAL_SEC * 1_000, key="dash_refresh")
 except ImportError:
-    # Graceful fallback: inject an HTML meta-refresh tag
     st.markdown(
         f'<meta http-equiv="refresh" content="{REFRESH_INTERVAL_SEC}">',
         unsafe_allow_html=True,
     )
 
-# ─────────────────────────────────────────────
-# DATA LOADING  (ttl matches refresh interval)
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# DATA LOADER  – handles the 3-section CSV format
+# ─────────────────────────────────────────────────────────────────────────────
+SECTION_LABELS = {
+    "A": "=== SECTION A: GAMES WITH DISCREPANCY ===",
+    "B": "=== SECTION B: GAMES WITHOUT DISCREPANCY ===",
+    "C": "=== SECTION C: UNMATCHED GAMES ===",
+}
+
+
 @st.cache_data(ttl=REFRESH_INTERVAL_SEC)
-def load_data() -> pd.DataFrame:
-    """Load and validate daily_log.csv."""
-    df = pd.read_csv("daily_log.csv", parse_dates=["Timestamp"])
+def load_sectioned_csv(path: str) -> dict[str, pd.DataFrame]:
+    """
+    Parse the multi-section CSV into three DataFrames keyed by section letter.
+    Returns empty DataFrames if the file is missing or malformed.
+    """
+    p = Path(path)
+    if not p.exists():
+        st.error(f"CSV file not found: {p.resolve()}\n\nRun `python scraper.py` first.")
+        return {k: pd.DataFrame() for k in "ABC"}
 
-    # --- Defensive column normalisation ---
-    # Strip accidental leading/trailing spaces from column names
-    df.columns = df.columns.str.strip()
+    raw_lines = p.read_text(encoding="utf-8").splitlines()
 
-    # Ensure required columns exist
-    required = {"Timestamp", "Difference (minutes)", "Team1", "Flashscore Time"}
-    missing = required - set(df.columns)
-    if missing:
-        st.error(f"CSV is missing required columns: {missing}")
-        st.stop()
+    sections: dict[str, list[str]] = {k: [] for k in "ABC"}
+    current = None
+    in_header = False   # skip the column-header row right after a section label
 
-    # Coerce 'Difference (minutes)' to numeric; bad values become NaN
-    df["Difference (minutes)"] = pd.to_numeric(df["Difference (minutes)"], errors="coerce")
+    # Map label text → section key
+    label_map = {v: k for k, v in SECTION_LABELS.items()}
 
-    # Parse hour safely: extract first two characters of 'Flashscore Time'
-    # Handles both 'HH:MM:SS' and 'HH:MM' formats
-    df["Hour"] = (
-        df["Flashscore Time"]
-        .astype(str)
-        .str.strip()
-        .str[:2]
-        .pipe(pd.to_numeric, errors="coerce")
-        .astype("Int64")   # nullable integer — survives NaN
-    )
+    for line in raw_lines:
+        stripped = line.strip().strip('"')
+        # Detect section start
+        for label_text, key in label_map.items():
+            if stripped.startswith(label_text.split("===")[1].strip()):
+                current = key
+                in_header = True   # next non-blank line is the column header
+                break
+        else:
+            if current is None:
+                continue
+            if not stripped:          # blank separator between sections
+                continue
+            if in_header:             # column header row
+                sections[current].append(line)
+                in_header = False
+                continue
+            sections[current].append(line)
 
-    return df
+    dfs: dict[str, pd.DataFrame] = {}
+    for key, lines in sections.items():
+        if not lines:
+            dfs[key] = pd.DataFrame()
+            continue
+        try:
+            text = "\n".join(lines)
+            df = pd.read_csv(io.StringIO(text))
+            # Drop placeholder rows
+            df = df[df["Team1"] != "(no records)"]
+            # Coerce types
+            if "Difference (minutes)" in df.columns:
+                df["Difference (minutes)"] = pd.to_numeric(
+                    df["Difference (minutes)"], errors="coerce"
+                )
+            if "Timestamp" in df.columns:
+                df["Timestamp"] = pd.to_datetime(df["Timestamp"], errors="coerce")
+            dfs[key] = df
+        except Exception as exc:
+            st.warning(f"Could not parse Section {key}: {exc}")
+            dfs[key] = pd.DataFrame()
+
+    return dfs
 
 
-# ─────────────────────────────────────────────
-# LOAD DATA
-# ─────────────────────────────────────────────
-df = load_data()
+# ─────────────────────────────────────────────────────────────────────────────
+# LOAD
+# ─────────────────────────────────────────────────────────────────────────────
+dfs = load_sectioned_csv(str(CSV_PATH))
+df_disc   = dfs["A"]   # discrepancy
+df_nodis  = dfs["B"]   # no discrepancy
+df_unmatch = dfs["C"]  # unmatched
 
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 # HEADER
-# ─────────────────────────────────────────────
-st.title("⚡ Discrepancy Analytics Dashboard")
-st.caption(f"Last loaded: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}  •  Auto-refreshes every 2 hours")
-
-st.divider()
-
-# ─────────────────────────────────────────────
-# SECTION 1 — GENERAL STATS
-# ─────────────────────────────────────────────
-st.header("📊 General Stats")
-
-total_discrepancies = len(df)
-avg_diff = df["Difference (minutes)"].mean()   # NaN-safe with pandas mean()
-max_diff = df["Difference (minutes)"].max()
-
-col1, col2, col3 = st.columns(3)
-col1.metric("Total Discrepancies", total_discrepancies)
-col2.metric("Average Difference (min)", f"{avg_diff:.2f}" if pd.notna(avg_diff) else "N/A")
-col3.metric("Max Difference (min)", f"{max_diff:.2f}" if pd.notna(max_diff) else "N/A")
-
-st.divider()
-
-# ─────────────────────────────────────────────
-# SECTION 2 — TEAM / LEAGUE ANALYSIS
-# ─────────────────────────────────────────────
-st.header("🏆 Team / League Analysis")
-
-team_counts = (
-    df.groupby("Team1", dropna=False)
-    .size()
-    .reset_index(name="Discrepancy Count")
-    .sort_values("Discrepancy Count", ascending=False)
+# ─────────────────────────────────────────────────────────────────────────────
+st.title("⚡ Odibets × Flashscore — Match Discrepancy Dashboard")
+st.caption(
+    f"Last loaded: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} EAT  •  "
+    f"Auto-refreshes every 2 hours"
 )
+st.divider()
 
-st.subheader("Teams with Most Discrepancies")
-st.dataframe(team_counts, use_container_width=True, hide_index=True)
+# ─────────────────────────────────────────────────────────────────────────────
+# SUMMARY METRICS
+# ─────────────────────────────────────────────────────────────────────────────
+st.header("📊 Summary")
 
-if "League" in df.columns:
-    league_counts = (
-        df.groupby("League", dropna=False)
-        .size()
-        .reset_index(name="Discrepancy Count")
-        .sort_values("Discrepancy Count", ascending=False)
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("🔴 With Discrepancy",    len(df_disc))
+c2.metric("🟢 No Discrepancy",      len(df_nodis))
+c3.metric("🟡 Unmatched",           len(df_unmatch))
+c4.metric("📋 Total Games Seen",    len(df_disc) + len(df_nodis) + len(df_unmatch))
+
+if not df_disc.empty and "Difference (minutes)" in df_disc.columns:
+    avg_d = df_disc["Difference (minutes)"].mean()
+    max_d = df_disc["Difference (minutes)"].max()
+    ca, cb = st.columns(2)
+    ca.metric("Avg Discrepancy (min)", f"{avg_d:.1f}" if pd.notna(avg_d) else "N/A")
+    cb.metric("Max Discrepancy (min)", f"{max_d:.0f}" if pd.notna(max_d) else "N/A")
+
+st.divider()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TABS  – one per section
+# ─────────────────────────────────────────────────────────────────────────────
+tab_a, tab_b, tab_c, tab_charts = st.tabs([
+    "🔴 With Discrepancy",
+    "🟢 No Discrepancy",
+    "🟡 Unmatched",
+    "📈 Charts",
+])
+
+# ── Tab A: Discrepancy ────────────────────────────────────────────────────────
+with tab_a:
+    st.subheader(f"Games With Discrepancy  ({len(df_disc)} games)")
+    if df_disc.empty:
+        st.info("No discrepancies found in the last run.")
+    else:
+        # Highlight high-discrepancy rows
+        def highlight_disc(row):
+            diff = row.get("Difference (minutes)", 0)
+            if pd.notna(diff) and diff > 30:
+                return ["background-color: #ffe0e0"] * len(row)
+            elif pd.notna(diff) and diff > 15:
+                return ["background-color: #fff3cd"] * len(row)
+            return [""] * len(row)
+
+        st.dataframe(
+            df_disc.style.apply(highlight_disc, axis=1),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        # League breakdown
+        if "League" in df_disc.columns:
+            lc = (
+                df_disc.groupby("League")["Difference (minutes)"]
+                .agg(Count="count", Avg_Diff="mean")
+                .reset_index()
+                .sort_values("Count", ascending=False)
+            )
+            st.markdown("**Discrepancies by League**")
+            st.dataframe(lc, use_container_width=True, hide_index=True)
+
+
+# ── Tab B: No Discrepancy ─────────────────────────────────────────────────────
+with tab_b:
+    st.subheader(f"Games Without Discrepancy  ({len(df_nodis)} games)")
+    if df_nodis.empty:
+        st.info("No matched games with agreeing times yet.")
+    else:
+        st.dataframe(df_nodis, use_container_width=True, hide_index=True)
+
+
+# ── Tab C: Unmatched ──────────────────────────────────────────────────────────
+with tab_c:
+    st.subheader(f"Unmatched Games  ({len(df_unmatch)} games)")
+    if df_unmatch.empty:
+        st.info("All games were matched between the two sources.")
+    else:
+        # Split by source
+        if "Source" in df_unmatch.columns:
+            odi_only   = df_unmatch[df_unmatch["Source"] == "odibets"]
+            flash_only = df_unmatch[df_unmatch["Source"] == "flashscore"]
+
+            col1, col2 = st.columns(2)
+            with col1:
+                st.markdown(f"**Odibets only** — {len(odi_only)} games")
+                st.dataframe(odi_only, use_container_width=True, hide_index=True)
+            with col2:
+                st.markdown(f"**Flashscore only** — {len(flash_only)} games")
+                st.dataframe(flash_only, use_container_width=True, hide_index=True)
+        else:
+            st.dataframe(df_unmatch, use_container_width=True, hide_index=True)
+
+
+# ── Tab D: Charts ─────────────────────────────────────────────────────────────
+with tab_charts:
+    st.subheader("📈 Analytics Charts")
+
+    # Chart 1: Discrepancy size distribution
+    if not df_disc.empty and "Difference (minutes)" in df_disc.columns:
+        fig1 = px.histogram(
+            df_disc.dropna(subset=["Difference (minutes)"]),
+            x="Difference (minutes)",
+            nbins=20,
+            title="Distribution of Discrepancy Sizes",
+            labels={"Difference (minutes)": "Difference (minutes)", "count": "Games"},
+            color_discrete_sequence=["#e05c5c"],
+        )
+        st.plotly_chart(fig1, use_container_width=True)
+
+    # Chart 2: Discrepancies by League
+    combined = pd.concat(
+        [df_disc.assign(Category="Discrepancy"),
+         df_nodis.assign(Category="No Discrepancy"),
+         df_unmatch.assign(Category="Unmatched")],
+        ignore_index=True,
     )
-    st.subheader("Leagues with Most Discrepancies")
-    st.dataframe(league_counts, use_container_width=True, hide_index=True)
+
+    if "League" in combined.columns and not combined.empty:
+        league_cat = (
+            combined.groupby(["League", "Category"])
+            .size()
+            .reset_index(name="Count")
+            .sort_values("Count", ascending=False)
+        )
+        fig2 = px.bar(
+            league_cat.head(30),
+            x="League",
+            y="Count",
+            color="Category",
+            title="Games per League (colour = category)",
+            color_discrete_map={
+                "Discrepancy":    "#e05c5c",
+                "No Discrepancy": "#4caf50",
+                "Unmatched":      "#ffc107",
+            },
+        )
+        fig2.update_xaxes(tickangle=-40)
+        st.plotly_chart(fig2, use_container_width=True)
+
+    # Chart 3: Kick-off hour heatmap (discrepancy only)
+    if not df_disc.empty and "Flashscore_Time" in df_disc.columns:
+        df_disc["Hour"] = (
+            df_disc["Flashscore_Time"]
+            .astype(str)
+            .str.extract(r"(\d{1,2}):\d{2}")[0]
+            .pipe(pd.to_numeric, errors="coerce")
+            .astype("Int64")
+        )
+        hour_counts = (
+            df_disc.dropna(subset=["Hour"])
+            .groupby("Hour")
+            .size()
+            .reset_index(name="Discrepancy Count")
+            .sort_values("Hour")
+        )
+        fig3 = px.bar(
+            hour_counts,
+            x="Hour",
+            y="Discrepancy Count",
+            title="Discrepancies by Hour of Day (Nairobi time)",
+            labels={"Hour": "Hour (0–23)"},
+            color_discrete_sequence=["#ff7043"],
+        )
+        fig3.update_xaxes(dtick=1)
+        st.plotly_chart(fig3, use_container_width=True)
+
+    # Chart 4: Trend over time
+    all_ts = pd.concat(
+        [df_disc.assign(Category="Discrepancy"),
+         df_nodis.assign(Category="No Discrepancy")],
+        ignore_index=True,
+    )
+    if "Timestamp" in all_ts.columns and not all_ts.empty:
+        all_ts["Date"] = all_ts["Timestamp"].dt.date
+        trend = (
+            all_ts.groupby(["Date", "Category"])
+            .size()
+            .reset_index(name="Count")
+        )
+        fig4 = px.line(
+            trend,
+            x="Date",
+            y="Count",
+            color="Category",
+            title="Daily Match Count by Category",
+            markers=True,
+            color_discrete_map={
+                "Discrepancy":    "#e05c5c",
+                "No Discrepancy": "#4caf50",
+            },
+        )
+        st.plotly_chart(fig4, use_container_width=True)
 
 st.divider()
-
-# ─────────────────────────────────────────────
-# SECTION 3 — DISCREPANCY BY HOUR
-# ─────────────────────────────────────────────
-st.header("⏱️ Discrepancy by Hour")
-
-hour_counts = (
-    df.dropna(subset=["Hour"])          # drop rows where hour couldn't be parsed
-    .groupby("Hour")
-    .size()
-    .reset_index(name="Discrepancy Count")
-    .sort_values("Hour")
+st.caption(
+    "Data sourced from odibets.com and flashscore.co.ke via automated scraping. "
+    "Dashboard auto-refreshes every 2 hours. Reload the page to force a refresh."
 )
-
-fig_hour = px.bar(
-    hour_counts,
-    x="Hour",
-    y="Discrepancy Count",
-    title="Discrepancies by Hour of Day",
-    labels={"Hour": "Hour of Day (0–23)", "Discrepancy Count": "Count"},
-)
-fig_hour.update_xaxes(dtick=1)  # show every hour on x-axis
-st.plotly_chart(fig_hour, use_container_width=True)
-
-st.divider()
-
-# ─────────────────────────────────────────────
-# SECTION 4 — TREND OVER TIME
-# ─────────────────────────────────────────────
-st.header("📈 Discrepancy Trend Over Time")
-
-# FIX: group by date derived from Timestamp (was previously computed outside
-# this block and could fail if Timestamp parsing had issues)
-df_valid_ts = df.dropna(subset=["Timestamp"])
-
-daily_summary = (
-    df_valid_ts
-    .groupby(df_valid_ts["Timestamp"].dt.date)["Difference (minutes)"]
-    .agg(Count="count", Avg_Difference="mean")
-    .reset_index()
-    .rename(columns={"Timestamp": "Date"})  # dt.date produces 'Timestamp' as col name
-)
-
-# FIX: plotly expects string column names in y= list; rename for clarity
-fig_trend = px.line(
-    daily_summary,
-    x="Date",
-    y=["Count", "Avg_Difference"],
-    labels={
-        "value": "Count / Avg Difference (min)",
-        "Date": "Date",
-        "variable": "Metric",
-    },
-    title="Daily Discrepancy Count & Average Difference",
-)
-# Rename legend labels for readability
-newnames = {"Count": "Daily Count", "Avg_Difference": "Avg Difference (min)"}
-fig_trend.for_each_trace(lambda t: t.update(name=newnames.get(t.name, t.name)))
-st.plotly_chart(fig_trend, use_container_width=True)
-
-st.divider()
-
-# ─────────────────────────────────────────────
-# FOOTER
-# ─────────────────────────────────────────────
-st.caption("Dashboard auto-refreshes every 2 hours. To force a refresh, reload the page.")
