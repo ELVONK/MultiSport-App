@@ -43,12 +43,32 @@ from playwright.sync_api import sync_playwright, Page, TimeoutError as PWTimeout
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────────────────────────────────────────
-OUTPUT_CSV       = Path("daily_log.csv")
-DISCREPANCY_MIN  = 5          # minutes difference to flag as discrepancy
-FUZZY_THRESHOLD  = 72         # min fuzzy score (0-100) for team-name match
-HEADLESS         = True       # set False to watch the browser
-TIMEOUT_MS       = 30_000     # page-load timeout in ms
-LOOP_INTERVAL_S  = 7_200      # 2 hours
+OUTPUT_CSV        = Path("daily_log.csv")
+DISCREPANCY_MIN   = 5          # minutes difference to flag as discrepancy
+FUZZY_THRESHOLD   = 72         # min fuzzy score (0-100) for team-name match
+LEAGUE_FUZZY_THRESHOLD = 78    # min fuzzy score (0-100) for league-name match
+HEADLESS          = True       # set False to watch the browser
+TIMEOUT_MS        = 30_000     # page-load timeout in ms
+LOOP_INTERVAL_S   = 7_200      # 2 hours
+
+# Regex for a live/in-play clock shown instead of a kickoff time, e.g. "34'",
+# "45+2'", or the "HT"/"FT" markers some sites use between periods.
+LIVE_TIME_RE = re.compile(r"^\d+(\+\d+)?'$")
+LIVE_STATUS_WORDS = {"HT", "FT", "LIVE"}
+
+# Qualifier words that mark a genuinely DIFFERENT competition, not noise.
+# "Amateur" is deliberately excluded: Odibets tags a whole tier of leagues
+# "Amateur" with no Flashscore equivalent, so requiring it to match would
+# block every amateur-league mapping. Women's/age-group tags, on the other
+# hand, must match exactly, or a fuzzy scorer like token_set_ratio (which
+# ignores tokens only one side has) will happily conflate e.g. "Bundesliga"
+# with "Bundesliga Women", or "Altach" with "Altach U21".
+HARD_DIVISION_TAGS = {"women", "w", "u23", "u21", "u20", "u19", "u18", "u17",
+                       "ii", "b", "reserves", "reserve"}
+
+
+def _division_tags(s: str) -> frozenset:
+    return frozenset(tok for tok in s.split() if tok in HARD_DIVISION_TAGS)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -84,12 +104,70 @@ class Match:
             return int(m.group(1)) * 60 + int(m.group(2))
         return None
 
+    @property
+    def is_live(self) -> bool:
+        """
+        True if match_time holds an in-play marker (e.g. "34'", "45+2'",
+        "HT") instead of a scheduled "HH:MM" kickoff time. Comparing a live
+        minute to a scheduled kickoff produces meaningless "discrepancies",
+        so live games are routed to their own bucket instead.
+        """
+        t = self.match_time.strip().upper()
+        return bool(LIVE_TIME_RE.match(self.match_time.strip())) or t in LIVE_STATUS_WORDS
+
+    @property
+    def league_key(self) -> tuple[str, str]:
+        """Normalised (country, league) pair used to scope team matching."""
+        return normalize_league(self.league, self.source)
+
 
 def _norm(name: str) -> str:
     """Lower-case, strip punctuation/extra spaces for fuzzy comparison."""
     name = name.lower().strip()
     name = re.sub(r"[^a-z0-9 ]", " ", name)
     return re.sub(r"\s+", " ", name).strip()
+
+
+def normalize_league(raw: str, source: str) -> tuple[str, str]:
+    """
+    Parse a site's raw league label into a canonical (country, league) pair
+    so we can scope team-name matching to "the same league on both sites"
+    instead of fuzzy-matching team names against the entire other site.
+
+    Odibets groups matches under headers like:
+        "Austria Amateur / Burgenland, Burgenländiga (1)"
+        "Brazil / Amazonense, Serie B (1)"
+    -> country part before "/", league part after "/", trailing "(n)" count
+       stripped. Qualifiers like "Amateur", "Women", "U21" are KEPT (just
+       whitespace/punctuation-normalised) because they distinguish genuinely
+       different competitions, not noise to discard.
+
+    Flashscore groups matches under headers like:
+        "AUSTRIA: Burgenland"
+        "AUSTRIA: Bundesliga Women"
+    -> country part before ":", league part after.
+    """
+    raw = (raw or "").strip()
+    if not raw:
+        return "", ""
+
+    if source == "odibets":
+        raw = re.sub(r"\(\d+\)\s*$", "", raw).strip()   # drop trailing "(n)" count
+        if "/" in raw:
+            country_part, league_part = raw.split("/", 1)
+        else:
+            country_part, league_part = raw, ""
+        country = _norm(country_part)
+        league = _norm(league_part.replace(",", " "))
+    else:  # flashscore
+        if ":" in raw:
+            country_part, league_part = raw.split(":", 1)
+        else:
+            country_part, league_part = raw, ""
+        country = _norm(country_part)
+        league = _norm(league_part)
+
+    return country, league
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -323,37 +401,108 @@ def fuzzy_match_teams(query: str, candidates: list[str]) -> Optional[str]:
     return None
 
 
-def compare_matches(odi_matches: list[Match],
-                    flash_matches: list[Match]) -> tuple[list[dict], list[dict], list[dict]]:
+def build_league_map(odi_matches: list[Match],
+                      flash_matches: list[Match]) -> dict[tuple[str, str], tuple[str, str]]:
     """
-    Returns three lists of row-dicts:
+    Fuzzy-match each distinct Odibets (country, league) pair to the closest
+    Flashscore (country, league) pair, once per run. This is what lets team
+    matching stay scoped to "the same league" instead of searching the whole
+    other site — the biggest source of false-positive team matches when two
+    unrelated leagues both have a team called e.g. "Rotenberg" or "Vienna".
+    """
+    odi_leagues   = sorted({m.league_key for m in odi_matches if any(m.league_key)})
+    flash_leagues = sorted({m.league_key for m in flash_matches if any(m.league_key)})
+
+    if not odi_leagues or not flash_leagues:
+        return {}
+
+    league_map: dict[tuple[str, str], tuple[str, str]] = {}
+    for country, league in odi_leagues:
+        query = f"{country} {league}".strip()
+        query_tags = _division_tags(query)
+
+        # Only consider Flashscore leagues carrying the SAME hard division
+        # tags (women's stays with women's, U21 stays with U21, etc.) —
+        # this check runs BEFORE fuzzy scoring, not as a tiebreaker after,
+        # so a high fuzzy score can never override a real division mismatch.
+        candidate_pairs = [(c, l) for (c, l) in flash_leagues
+                            if _division_tags(f"{c} {l}") == query_tags]
+        if not candidate_pairs:
+            continue
+
+        candidate_strs = [f"{c} {l}".strip() for c, l in candidate_pairs]
+        # token_set_ratio (not token_sort_ratio) because Odibets labels carry
+        # extra qualifier words Flashscore's don't (e.g. "Austria Amateur /
+        # Burgenland, Burgenländiga" vs "Austria: Burgenland") — token_sort
+        # penalises that length mismatch hard, token_set ignores the tokens
+        # only one side has and compares the overlapping core.
+        result = process.extractOne(query, candidate_strs, scorer=fuzz.token_set_ratio)
+        if result and result[1] >= LEAGUE_FUZZY_THRESHOLD:
+            idx = candidate_strs.index(result[0])
+            league_map[(country, league)] = candidate_pairs[idx]
+
+    return league_map
+
+
+def compare_matches(odi_matches: list[Match],
+                    flash_matches: list[Match]
+                    ) -> tuple[list[dict], list[dict], list[dict], list[dict]]:
+    """
+    Returns four lists of row-dicts:
         discrepancy    – same game, kick-off time differs > DISCREPANCY_MIN
         no_discrepancy – same game, kick-off times agree (or both missing)
         unmatched      – game exists on only one source
+        live           – same game, but one or both sides show an in-play
+                         marker instead of a scheduled time (not a real
+                         "discrepancy" — the game has already kicked off)
+
+    Team names are only fuzzy-matched against candidates from the SAME
+    mapped league (see build_league_map), not the entire other site's
+    match list. Games whose league couldn't be confidently mapped fall
+    back to the unscoped candidate pool of games with no league info at
+    all, rather than silently matching across unrelated leagues.
     """
     discrepancy:    list[dict] = []
     no_discrepancy: list[dict] = []
     unmatched:      list[dict] = []
+    live:           list[dict] = []
 
-    flash_index = {m.key: m for m in flash_matches}
-    flash_keys  = list(flash_index.keys())
-    matched_flash_keys: set[str] = set()
+    league_map = build_league_map(odi_matches, flash_matches)
+
+    flash_by_league: dict[tuple[str, str], list[Match]] = {}
+    for fm in flash_matches:
+        flash_by_league.setdefault(fm.league_key, []).append(fm)
+
+    matched_flash_ids: set[int] = set()
 
     for om in odi_matches:
-        # Exact key match first, then fuzzy
-        fkey = om.key if om.key in flash_index else fuzzy_match_teams(om.key, flash_keys)
+        mapped_league = league_map.get(om.league_key)
+        # Fall back to Flashscore games with no league info at all only if
+        # this Odibets game also has no league info — never fall back to
+        # searching every league, that's what causes false team matches.
+        if mapped_league is None and not any(om.league_key):
+            mapped_league = ("", "")
 
-        if fkey and fkey in flash_index:
-            fm = flash_index[fkey]
-            matched_flash_keys.add(fkey)
+        candidates = [fm for fm in flash_by_league.get(mapped_league, [])
+                      if id(fm) not in matched_flash_ids] if mapped_league else []
+
+        candidate_keys = [fm.key for fm in candidates]
+        fkey = om.key if om.key in candidate_keys else fuzzy_match_teams(om.key, candidate_keys)
+
+        fm = None
+        if fkey:
+            fm = next((c for c in candidates if c.key == fkey), None)
+
+        if fm is not None:
+            matched_flash_ids.add(id(fm))
+
+            if om.is_live or fm.is_live:
+                live.append(_build_row(om, fm, None))
+                continue
 
             ot = om.time_minutes
             ft = fm.time_minutes
-
-            if ot is not None and ft is not None:
-                diff = abs(ot - ft)
-            else:
-                diff = None
+            diff = abs(ot - ft) if ot is not None and ft is not None else None
 
             row = _build_row(om, fm, diff)
 
@@ -362,15 +511,15 @@ def compare_matches(odi_matches: list[Match],
             else:
                 no_discrepancy.append(row)
         else:
-            # Odibets only
+            # Odibets only (within its league scope)
             unmatched.append(_build_unmatched_row(om))
 
-    # Flashscore-only games
-    for fkey, fm in flash_index.items():
-        if fkey not in matched_flash_keys:
+    # Flashscore-only games (never claimed by any Odibets match above)
+    for fm in flash_matches:
+        if id(fm) not in matched_flash_ids:
             unmatched.append(_build_unmatched_row(fm))
 
-    return discrepancy, no_discrepancy, unmatched
+    return discrepancy, no_discrepancy, unmatched, live
 
 
 def _build_row(om: Match, fm: Match, diff: Optional[int]) -> dict:
@@ -427,15 +576,17 @@ COLUMNS = [
 
 def write_csv(discrepancy: list[dict],
               no_discrepancy: list[dict],
-              unmatched: list[dict]) -> None:
+              unmatched: list[dict],
+              live: list[dict]) -> None:
     """
-    Write a single CSV with three clearly labelled sections separated by
+    Write a single CSV with four clearly labelled sections separated by
     blank lines and section-header rows.
     """
     sections = [
         ("=== SECTION A: GAMES WITH DISCREPANCY ===",    discrepancy),
         ("=== SECTION B: GAMES WITHOUT DISCREPANCY ===", no_discrepancy),
         ("=== SECTION C: UNMATCHED GAMES ===",           unmatched),
+        ("=== SECTION D: LIVE / IN-PLAY GAMES ===",      live),
     ]
 
     with OUTPUT_CSV.open("w", newline="", encoding="utf-8") as fh:
@@ -455,12 +606,13 @@ def write_csv(discrepancy: list[dict],
             # Blank separator
             writer.writerow([])
 
-    total = len(discrepancy) + len(no_discrepancy) + len(unmatched)
+    total = len(discrepancy) + len(no_discrepancy) + len(unmatched) + len(live)
     log.info(
         f"CSV written → {OUTPUT_CSV}  |  "
         f"Discrepancy: {len(discrepancy)}  "
         f"No-discrepancy: {len(no_discrepancy)}  "
         f"Unmatched: {len(unmatched)}  "
+        f"Live: {len(live)}  "
         f"Total: {total}"
     )
 
@@ -508,8 +660,8 @@ def run_once() -> None:
         browser.close()
 
     # ── Compare & output ───────────────────────────────────────────────────
-    discrepancy, no_discrepancy, unmatched = compare_matches(odi_matches, flash_matches)
-    write_csv(discrepancy, no_discrepancy, unmatched)
+    discrepancy, no_discrepancy, unmatched, live = compare_matches(odi_matches, flash_matches)
+    write_csv(discrepancy, no_discrepancy, unmatched, live)
     log.info("Run complete.")
 
 
